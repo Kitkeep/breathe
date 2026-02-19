@@ -7,24 +7,14 @@ Features:
  - GET  /send_wave    -> send a single GET to TARGET_URL
  - POST /receive_pulse-> forward the incoming JSON/form to FORWARD_URLS (with retries)
  - Background auto-pinger posts pulses at random intervals (MIN_INTERVAL..MAX_INTERVAL)
- - Wake-first logic: do a quick GET to the target base (root or /ping) to wake sleeping apps
+ - Wake-first logic: do a quick GET to the target base (/ping then /) to wake sleeping apps
  - Configurable timeouts, retries, backoff, and per-target delay via environment variables
-
-ENV vars (new ones added):
- - TIMEOUT           : seconds for requests timeout (default 30)
- - RETRIES           : number of attempts for POST (default 3)
- - BACKOFF_BASE      : base seconds for exponential backoff (default 2.0)
- - WAKE_FIRST        : "true"/"1"/"yes" to try a quick GET to base before POST (default true)
- - PING_PATH         : quick wake path to try first (default "/ping" then "/")
- - LOG_PREFIX        : prefix shown in logs (default "breathe")
- - ... (see original docstring above for other envs)
 """
 
 import os
 import time
 import random
 import threading
-import json
 import sys
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify
@@ -41,13 +31,13 @@ except Exception:
 DEFAULT_TARGET_BASE = os.environ.get("TARGET_URL", "https://exercise-go9d.onrender.com").strip()
 DEFAULT_PULSE_PATH = "/pulse_receiver"
 
+# Note: jevicarn intentionally omitted per request
 DEFAULT_FORWARD_URLS = [
     "https://exercise-go9d.onrender.com",
     "https://who-i-am-uzh6.onrender.com",
     "https://tomorrow-personal-app.onrender.com",
     "https://breathe-5006.onrender.com",
     "https://church-i0im.onrender.com",
-    # jevicarn intentionally omitted per request
 ]
 
 # Read env
@@ -57,28 +47,28 @@ raw_list = os.environ.get("FORWARD_URLS", "").strip()
 FORWARD_TOKEN = os.environ.get("FORWARD_TOKEN")  # optional X-PULSE-TOKEN
 AUTO_PING = os.environ.get("AUTO_PING", "true").lower() in ("1", "true", "yes")
 
-# intervals
+# intervals (defaults chosen to be well under 55s as requested)
 try:
-    MIN_INTERVAL = float(os.environ.get("MIN_INTERVAL", "15"))
-    MAX_INTERVAL = float(os.environ.get("MAX_INTERVAL", "49"))
+    MIN_INTERVAL = float(os.environ.get("MIN_INTERVAL", "10"))  # default 10s
+    MAX_INTERVAL = float(os.environ.get("MAX_INTERVAL", "45"))  # default 45s
 except Exception:
-    MIN_INTERVAL, MAX_INTERVAL = 15.0, 49.0
+    MIN_INTERVAL, MAX_INTERVAL = 10.0, 45.0
 
 try:
     PER_TARGET_DELAY = float(os.environ.get("PER_TARGET_DELAY", "0.15"))
 except Exception:
     PER_TARGET_DELAY = 0.15
 
-# New robustness options
+# Robustness options
 try:
-    TIMEOUT = float(os.environ.get("TIMEOUT", "30"))          # seconds for requests
+    TIMEOUT = float(os.environ.get("TIMEOUT", "60"))          # seconds for requests
 except Exception:
-    TIMEOUT = 30.0
+    TIMEOUT = 60.0
 
 try:
-    RETRIES = int(os.environ.get("RETRIES", "3"))             # attempts per POST
+    RETRIES = int(os.environ.get("RETRIES", "4"))             # attempts per POST
 except Exception:
-    RETRIES = 3
+    RETRIES = 4
 
 try:
     BACKOFF_BASE = float(os.environ.get("BACKOFF_BASE", "2.0"))
@@ -92,11 +82,11 @@ LOG_PREFIX = os.environ.get("LOG_PREFIX", "breathe")
 
 # sanitize
 if MIN_INTERVAL <= 0 or MAX_INTERVAL <= 0 or MIN_INTERVAL > MAX_INTERVAL:
-    MIN_INTERVAL, MAX_INTERVAL = 15.0, 49.0
+    MIN_INTERVAL, MAX_INTERVAL = 10.0, 45.0
 if PER_TARGET_DELAY < 0:
     PER_TARGET_DELAY = 0.0
 if TIMEOUT < 1:
-    TIMEOUT = 30.0
+    TIMEOUT = 60.0
 if RETRIES < 1:
     RETRIES = 1
 
@@ -109,7 +99,6 @@ def _log(*a, **k):
     sys.stdout.flush()
 
 def normalize_target_candidate(candidate: str) -> str:
-    """Return URL that ends with /pulse_receiver (no duplicated segments)."""
     if not candidate:
         return None
     c = candidate.strip()
@@ -120,42 +109,39 @@ def normalize_target_candidate(candidate: str) -> str:
     while lower.endswith('/pulse_receiver'):
         c = c[: -len('/pulse_receiver')].rstrip('/')
         lower = c.lower().rstrip('/')
-    # append single path
     return c.rstrip('/') + DEFAULT_PULSE_PATH
 
 def base_from_pulse_url(pulse_url: str) -> str:
-    """From .../pulse_receiver -> return base like https://example.com"""
     if not pulse_url:
         return None
     if pulse_url.endswith(DEFAULT_PULSE_PATH):
         return pulse_url[:-len(DEFAULT_PULSE_PATH)]
-    # defensive: strip path component
     parsed = urlparse(pulse_url)
     return f"{parsed.scheme}://{parsed.netloc}"
 
-# safe check for HTTP response success
 def is_success_code(code):
     return isinstance(code, int) and 200 <= code < 300
 
-# perform a GET to a wake URL (try multiple PING_PATHS), returns True if any returned 2xx/3xx/200-399
 def try_wake_target(session_obj, base):
-    if not session_obj:
+    """Try GET to /ping and other ping paths to wake target; return True if any returns <400."""
+    if not session_obj or not base:
         return False
     for p in PING_PATHS:
         try:
-            url = base.rstrip('/') + (p if p.startswith('/') else '/' + p)
+            path = p if p.startswith("/") else f"/{p}"
+            url = base.rstrip("/") + path
             _log("wake: GET", url)
             r = session_obj.get(url, timeout=min(10, TIMEOUT))
-            if r.status_code >= 200 and r.status_code < 400:
+            if 200 <= r.status_code < 400:
                 _log("wake: success", url, "->", r.status_code)
                 return True
             _log("wake: non-success", url, "->", r.status_code)
         except Exception as e:
             _log("wake: error", base, "->", e)
-    # fallback: try root
+    # fallback root
     try:
-        r = session_obj.get(base.rstrip('/') + '/', timeout=min(10, TIMEOUT))
-        if r.status_code >= 200 and r.status_code < 400:
+        r = session_obj.get(base.rstrip("/") + "/", timeout=min(10, TIMEOUT))
+        if 200 <= r.status_code < 400:
             _log("wake: root success", base, "->", r.status_code)
             return True
     except Exception as e:
@@ -163,7 +149,7 @@ def try_wake_target(session_obj, base):
     return False
 
 def post_with_retries(session_obj, url, payload, headers=None, retries=RETRIES):
-    """POST json payload to url with retries and exponential backoff. Returns dict with result."""
+    """POST with retries and exponential backoff. Returns dict result."""
     if not session_obj:
         return {"url": url, "error": "requests not available"}
     headers = headers or {}
@@ -176,16 +162,13 @@ def post_with_retries(session_obj, url, payload, headers=None, retries=RETRIES):
             txt = (r.text[:400] if r.text else "")
             if is_success_code(r.status_code):
                 return {"url": url, "code": r.status_code, "text_snippet": txt, "attempts": attempt}
-            # non-2xx indicates server responded but with error; capture and possibly retry
             last_err = f"status={r.status_code} text={txt}"
             _log("post_with_retries: non-success", url, "->", r.status_code)
         except Exception as e:
             last_err = str(e)
             _log("post_with_retries: exception", url, "->", e)
-        # backoff before next attempt
         if attempt < retries:
             sleep_for = BACKOFF_BASE ** (attempt - 1)
-            # clamp a sensible cap
             if sleep_for > 30:
                 sleep_for = 30
             _log(f"post_with_retries: sleeping {sleep_for:.1f}s before retry to {url}")
@@ -204,9 +187,7 @@ elif LEGACY_FORWARD:
 else:
     FORWARD_URLS.extend(DEFAULT_FORWARD_URLS)
 
-# normalize
 FORWARD_URLS = [normalize_target_candidate(u) for u in FORWARD_URLS if u]
-# remove duplicates preserving order
 seen = set()
 final_targets = []
 for u in FORWARD_URLS:
@@ -250,7 +231,6 @@ def status():
 
 @app.route("/send_wave", methods=["GET"])
 def send_wave():
-    """Send a single GET to TARGET_URL (useful for testing)."""
     if not session:
         return jsonify({"status": "error", "error": "requests not installed"}), 500
     try:
@@ -261,42 +241,30 @@ def send_wave():
 
 @app.route("/receive_pulse", methods=["POST", "GET"])
 def receive_pulse():
-    """
-    Accept inbound pulse and forward it to all FORWARD_URLS as POST (JSON).
-    Returns per-target summary.
-    """
     if not session:
         return jsonify({"status": "error", "error": "requests not installed"}), 500
-
     payload = request.get_json(silent=True)
     if payload is None:
         payload = request.form.to_dict() or {"message": "ping"}
-
     headers = {}
     if FORWARD_TOKEN:
         headers["X-PULSE-TOKEN"] = FORWARD_TOKEN
-
     results = []
     for idx, u in enumerate(FORWARD_URLS):
         base = base_from_pulse_url(u)
-        # optionally try to wake target quickly
         if WAKE_FIRST and base:
             try_wake_target(session, base)
-            # tiny pause before actual POST
             time.sleep(0.05)
         res = post_with_retries(session, u, payload, headers=headers, retries=RETRIES)
         results.append(res)
-        # small stagger
         if PER_TARGET_DELAY and idx != len(FORWARD_URLS) - 1:
             time.sleep(PER_TARGET_DELAY)
-
     return jsonify({"status": "forwarded_to_multiple", "results": results}), 200
 
 # ------------------------
 # Background auto-pinger
 # ------------------------
 def auto_ping_loop():
-    """Daemon loop — posts to each FORWARD_URL at random intervals between MIN_INTERVAL and MAX_INTERVAL."""
     if not session:
         _log("auto_ping: requests not available; auto pinger disabled")
         return
@@ -313,7 +281,6 @@ def auto_ping_loop():
             base = base_from_pulse_url(u)
             if WAKE_FIRST and base:
                 try_wake_target(session, base)
-                # tiny pause so root sees slightly different timestamps
                 time.sleep(0.05)
             res = post_with_retries(session, u, payload, headers=headers, retries=RETRIES)
             if "code" in res:
@@ -323,7 +290,6 @@ def auto_ping_loop():
             if PER_TARGET_DELAY and idx != len(FORWARD_URLS) - 1:
                 time.sleep(PER_TARGET_DELAY)
 
-# start pinger if enabled
 if AUTO_PING:
     t = threading.Thread(target=auto_ping_loop, name="auto_ping", daemon=True)
     t.start()
@@ -366,7 +332,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.once:
         send_once_and_exit()
-
     port = int(os.environ.get("PORT", 5001))
     # dev server for local testing; in prod use gunicorn
     app.run(host="0.0.0.0", port=port)
