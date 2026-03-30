@@ -272,7 +272,19 @@ def send_once_and_exit():
             print(f"ERROR posting to {u}: {e}", file=sys.stderr)
             ok.append((u, str(e)))
     raise SystemExit(0 if any(isinstance(s, int) and s < 400 for _, s in ok) else 2)
+@app.route("/pulse_receiver", methods=["POST"])
+def pulse_receiver():
+    """
+    Compatibility endpoint so other services can ping this app.
+    """
+    payload = request.get_json(silent=True) or {"message": "ping"}
+    _log("pulse_receiver: received ping ->", payload)
 
+    return jsonify({
+        "status": "received",
+        "service": "breathe-xozy",
+        "timestamp": time.time()
+    }), 200
 # ------------------------
 # Run
 # ------------------------
