@@ -53,7 +53,8 @@ DEFAULT_FORWARD_URLS = [
     "https://e-agriculture.onrender.com",
     "https://davidsconnect.onrender.com",
     "https://breathe-xozy.onrender.com",
-    "https://tomorrow-agsg.onrender.com"
+    "https://tomorrow-agsg.onrender.com",
+    "https://riverhomes.onrender.com"
 ]
 
 # ------------------------
