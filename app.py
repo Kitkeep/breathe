@@ -54,6 +54,7 @@ DEFAULT_FORWARD_URLS = [
     "https://davidsconnect.onrender.com",
     "https://breathe-xozy.onrender.com",
     "https://tomorrow-agsg.onrender.com",
+    "https://kerryconnect360.onrender.com",
     "https://riverhomes.onrender.com"
 ]
 
