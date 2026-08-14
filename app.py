@@ -58,7 +58,7 @@ DEFAULT_FORWARD_URLS = [
     "https://kerryconnect360.onrender.com",
     "https://jevicarn-school.onrender.com",
     "https://riverhomes.onrender.com",
-    "https://joyschools.onrender.com/",
+    "https://joyschool.onrender.com/",
      "https://toror-technology.onrender.com"
 ]
 
