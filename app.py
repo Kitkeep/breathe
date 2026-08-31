@@ -1,29 +1,32 @@
-```python
 #!/usr/bin/env python3
 """
 breathe.py — small Flask app + background auto-pinger (multi-target, fixed path handling).
 
 Behavior:
-- GET  /             -> status JSON (shows forward_to list)
-- GET  /send_wave    -> send a single GET to TARGET_URL
-- POST /receive_pulse-> forward the incoming JSON/form to FORWARD_URLS
-  (with optional X-PULSE-TOKEN)
-- Background thread (daemon) optionally sends POST pulses to FORWARD_URLS
-  at random intervals between MIN_INTERVAL and MAX_INTERVAL.
+- GET  /                  -> status JSON (shows forward_to list)
+- GET  /send_wave        -> send a single GET to TARGET_URL
+- POST /receive_pulse    -> forward incoming JSON/form to FORWARD_URLS
+- GET  /receive_pulse    -> same, for compatibility
+- POST /pulse_receiver   -> receive a pulse from another service
+- Background thread      -> optionally sends POST pulses to FORWARD_URLS
+                            at random intervals between MIN_INTERVAL
+                            and MAX_INTERVAL.
 
 ENV vars:
 - TARGET_URL       : where /send_wave will GET
                        (default: https://exercise-go9d.onrender.com)
 - FORWARD_URL      : legacy single forward target (kept for compatibility)
 - FORWARD_URLS     : comma-separated list of forward targets (preferred).
-                     Can be full path or base. The code normalizes so each
-                     entry ends with /pulse_receiver (but will NOT duplicate it).
+                      Can be full path or base. The code normalizes so
+                      each entry ends with /pulse_receiver.
 - FORWARD_TOKEN    : optional header value X-PULSE-TOKEN when forwarding
-- AUTO_PING        : "true"/"1"/"yes" to enable background pinger (default: true)
-- MIN_INTERVAL     : min seconds for random interval (default: 15)
-- MAX_INTERVAL     : max seconds for random interval (default: 49)
-- PER_TARGET_DELAY : seconds to sleep between posting to targets (default: 0.15)
-- PORT             : port to listen on (default 5001)
+- AUTO_PING        : "true"/"1"/"yes" to enable background pinger
+                      (default: true)
+- MIN_INTERVAL     : minimum seconds for random interval (default: 15)
+- MAX_INTERVAL     : maximum seconds for random interval (default: 49)
+- PER_TARGET_DELAY : seconds to sleep between posting to targets
+                      (default: 0.15)
+- PORT             : port to listen on (default: 5001)
 """
 
 import os
@@ -34,7 +37,8 @@ import sys
 
 from flask import Flask, request, jsonify
 
-# defensive requests import — app runs without requests but network ops fail gracefully
+# Defensive requests import — app runs without requests,
+# but network operations fail gracefully.
 try:
     import requests
 except Exception:
@@ -45,12 +49,11 @@ except Exception:
 # Default targets
 # ------------------------
 
-# set your site as default target so send_wave and pinging will hit it by default
 DEFAULT_TARGET_BASE = "https://exercise-go9d.onrender.com"
 DEFAULT_PULSE_PATH = "/pulse_receiver"
 
-# default list of all important targets
-# IMPORTANT: each target is its own list item.
+# IMPORTANT:
+# Each target is a separate list item.
 DEFAULT_FORWARD_URLS = [
     "https://exercise-go9d.onrender.com",
     "https://tomorrow-personal-app.onrender.com",
@@ -67,6 +70,8 @@ DEFAULT_FORWARD_URLS = [
     "https://Jevics.onrender.com",
     "https://riverhomes.onrender.com",
     "https://prime-1-rd0g.onrender.com",
+
+    # FIXED: these are TWO separate targets, not one comma-joined string.
     "https://toror-technology.onrender.com",
     "https://easyqr-11kk.onrender.com",
 ]
@@ -76,38 +81,50 @@ DEFAULT_FORWARD_URLS = [
 # Config (env-driven)
 # ------------------------
 
-TARGET_URL = os.environ.get("TARGET_URL", DEFAULT_TARGET_BASE).strip()
+TARGET_URL = os.environ.get(
+    "TARGET_URL",
+    DEFAULT_TARGET_BASE
+).strip()
+
 LEGACY_FORWARD = os.environ.get("FORWARD_URL", "").strip()
 raw_list = os.environ.get("FORWARD_URLS", "").strip()
 
-# incoming/outgoing token header name is X-PULSE-TOKEN;
-# set FORWARD_TOKEN to include it when sending
+# Optional outgoing pulse token
 FORWARD_TOKEN = os.environ.get("FORWARD_TOKEN")
 
-AUTO_PING = os.environ.get("AUTO_PING", "true").lower() in (
-    "1",
-    "true",
-    "yes",
-)
+AUTO_PING = os.environ.get(
+    "AUTO_PING",
+    "true"
+).lower() in ("1", "true", "yes")
 
 
-# intervals
+# Intervals
 try:
-    MIN_INTERVAL = float(os.environ.get("MIN_INTERVAL", "15"))
-    MAX_INTERVAL = float(os.environ.get("MAX_INTERVAL", "49"))
+    MIN_INTERVAL = float(
+        os.environ.get("MIN_INTERVAL", "15")
+    )
+    MAX_INTERVAL = float(
+        os.environ.get("MAX_INTERVAL", "49")
+    )
 except Exception:
     MIN_INTERVAL = 15.0
     MAX_INTERVAL = 49.0
 
 
 try:
-    PER_TARGET_DELAY = float(os.environ.get("PER_TARGET_DELAY", "0.15"))
+    PER_TARGET_DELAY = float(
+        os.environ.get("PER_TARGET_DELAY", "0.15")
+    )
 except Exception:
     PER_TARGET_DELAY = 0.15
 
 
-# sanitize sane values
-if MIN_INTERVAL <= 0 or MAX_INTERVAL <= 0 or MIN_INTERVAL > MAX_INTERVAL:
+# Sanitize sane values
+if (
+    MIN_INTERVAL <= 0
+    or MAX_INTERVAL <= 0
+    or MIN_INTERVAL > MAX_INTERVAL
+):
     MIN_INTERVAL = 15.0
     MAX_INTERVAL = 49.0
 
@@ -122,11 +139,11 @@ if PER_TARGET_DELAY < 0:
 def normalize_target_candidate(candidate: str):
     """
     Accept candidate that may be:
-      - a full URL ending with /pulse_receiver or not
-      - a base like https://example.com (append /pulse_receiver)
+    - a full URL ending with /pulse_receiver
+    - a base like https://example.com
 
-    Return definitive URL that ends with /pulse_receiver
-    with no duplicated segments.
+    Returns a definitive URL ending with exactly one
+    /pulse_receiver.
     """
     if not candidate:
         return None
@@ -136,18 +153,16 @@ def normalize_target_candidate(candidate: str):
     if not c:
         return None
 
-    # strip trailing whitespace/slashes
     c = c.rstrip()
 
-    # remove any number of trailing /pulse_receiver (case-insensitive)
-    # so we avoid duplication like /pulse_receiver/pulse_receiver
+    # Remove any existing /pulse_receiver fragments
+    # so we avoid duplication.
     lower = c.lower().rstrip("/")
 
-    while lower.endswith("/pulse_receiver"):
-        c = c[: -len("/pulse_receiver")].rstrip("/")
+    while lower.endswith(DEFAULT_PULSE_PATH):
+        c = c[:-len(DEFAULT_PULSE_PATH)].rstrip("/")
         lower = c.lower().rstrip("/")
 
-    # now re-append single pulse path
     return c.rstrip("/") + DEFAULT_PULSE_PATH
 
 
@@ -159,19 +174,23 @@ FORWARD_URLS = []
 
 # 1. Environment variable (preferred)
 if raw_list:
-    items = [i.strip() for i in raw_list.split(",") if i.strip()]
+    items = [
+        item.strip()
+        for item in raw_list.split(",")
+        if item.strip()
+    ]
     FORWARD_URLS.extend(items)
 
 # 2. Legacy single forward
 elif LEGACY_FORWARD:
     FORWARD_URLS.append(LEGACY_FORWARD)
 
-# 3. Default all important targets (only if no env overrides)
+# 3. Default all important targets
 else:
     FORWARD_URLS.extend(DEFAULT_FORWARD_URLS)
 
 
-# normalize
+# Normalize
 FORWARD_URLS = [
     normalize_target_candidate(u)
     for u in FORWARD_URLS
@@ -179,7 +198,7 @@ FORWARD_URLS = [
 ]
 
 
-# remove duplicates, preserve order
+# Remove duplicates while preserving order
 seen = set()
 final_targets = []
 
@@ -192,17 +211,18 @@ FORWARD_URLS = final_targets
 
 
 # ------------------------
-# Flask app
+# Flask app + session
 # ------------------------
 
 app = Flask(__name__)
+
 _start_time = time.time()
 
 session = requests.Session() if requests else None
 
 
-def _log(*a, **k):
-    print(*a, **k)
+def _log(*args, **kwargs):
+    print(*args, **kwargs)
     sys.stdout.flush()
 
 
@@ -232,15 +252,18 @@ def root():
 
 @app.route("/send_wave", methods=["GET"])
 def send_wave():
-    """Send a single GET to TARGET_URL (useful for testing)."""
+    """Send a single GET to TARGET_URL."""
     if not session:
         return jsonify({
             "status": "error",
-            "error": "requests not installed"
+            "error": "requests not installed",
         }), 500
 
     try:
-        response = session.get(TARGET_URL, timeout=10)
+        response = session.get(
+            TARGET_URL,
+            timeout=10
+        )
 
         return jsonify({
             "status": "ok",
@@ -248,23 +271,23 @@ def send_wave():
             "code": response.status_code,
         }), 200
 
-    except Exception as e:
+    except Exception as exc:
         return jsonify({
             "status": "error",
-            "error": str(e),
+            "error": str(exc),
         }), 500
 
 
 @app.route("/receive_pulse", methods=["POST", "GET"])
 def receive_pulse():
     """
-    Accept inbound pulse and forward it to all FORWARD_URLS as POST (JSON).
+    Accept inbound pulse and forward it to all FORWARD_URLS as POST JSON.
     Returns per-target summary.
     """
     if not session:
         return jsonify({
             "status": "error",
-            "error": "requests not installed"
+            "error": "requests not installed",
         }), 500
 
     payload = request.get_json(silent=True)
@@ -281,40 +304,48 @@ def receive_pulse():
 
     results = []
 
-    for idx, url in enumerate(FORWARD_URLS):
+    for idx, target in enumerate(FORWARD_URLS):
         try:
             response = session.post(
-                url,
+                target,
                 json=payload,
                 headers=headers,
                 timeout=10,
             )
 
-            text = response.text[:300] if response.text else ""
+            text_snippet = (
+                response.text[:300]
+                if response.text
+                else ""
+            )
 
             results.append({
-                "url": url,
+                "url": target,
                 "code": response.status_code,
-                "text_snippet": text,
+                "text_snippet": text_snippet,
             })
 
             _log(
-                f"receive_pulse: forwarded to {url} -> "
-                f"{response.status_code}"
+                f"receive_pulse: forwarded to "
+                f"{target} -> {response.status_code}"
             )
 
-        except Exception as e:
+        except Exception as exc:
             results.append({
-                "url": url,
-                "error": str(e),
+                "url": target,
+                "error": str(exc),
             })
 
             _log(
-                f"receive_pulse: error forwarding to {url}: {e}"
+                f"receive_pulse: error forwarding to "
+                f"{target}: {exc}"
             )
 
-        # small stagger to avoid hammering
-        if PER_TARGET_DELAY and idx != len(FORWARD_URLS) - 1:
+        # Small stagger to avoid hammering
+        if (
+            PER_TARGET_DELAY
+            and idx != len(FORWARD_URLS) - 1
+        ):
             time.sleep(PER_TARGET_DELAY)
 
     return jsonify({
@@ -340,7 +371,7 @@ def auto_ping_loop():
         return
 
     _log(
-        f"auto_ping: starting loop -> forwarding to "
+        "auto_ping: starting loop -> forwarding to "
         f"{len(FORWARD_URLS)} targets every "
         f"{MIN_INTERVAL}-{MAX_INTERVAL}s (random)"
     )
@@ -348,7 +379,7 @@ def auto_ping_loop():
     while True:
         wait = random.uniform(
             MIN_INTERVAL,
-            MAX_INTERVAL,
+            MAX_INTERVAL
         )
 
         _log(
@@ -361,7 +392,7 @@ def auto_ping_loop():
             "source": "breathe",
             "timestamp": time.strftime(
                 "%Y-%m-%dT%H:%M:%SZ",
-                time.gmtime(),
+                time.gmtime()
             ),
         }
 
@@ -370,31 +401,37 @@ def auto_ping_loop():
         if FORWARD_TOKEN:
             headers["X-PULSE-TOKEN"] = FORWARD_TOKEN
 
-        for idx, url in enumerate(FORWARD_URLS):
+        for idx, target in enumerate(FORWARD_URLS):
             try:
                 response = session.post(
-                    url,
+                    target,
                     json=payload,
                     headers=headers,
                     timeout=10,
                 )
 
                 _log(
-                    f"auto_ping: POST {url} -> "
+                    f"auto_ping: POST "
+                    f"{target} -> "
                     f"{response.status_code}"
                 )
 
-            except Exception as e:
+            except Exception as exc:
                 _log(
-                    f"auto_ping: error posting to {url}: {e}"
+                    f"auto_ping: error posting to "
+                    f"{target}: {exc}"
                 )
 
-            # tiny stagger so multiple targets don't get exact same timing
-            if PER_TARGET_DELAY and idx != len(FORWARD_URLS) - 1:
+            # Tiny stagger so multiple targets
+            # don't get the exact same timestamp.
+            if (
+                PER_TARGET_DELAY
+                and idx != len(FORWARD_URLS) - 1
+            ):
                 time.sleep(PER_TARGET_DELAY)
 
 
-# start pinger if enabled
+# Start pinger if enabled
 if AUTO_PING:
     t = threading.Thread(
         target=auto_ping_loop,
@@ -414,10 +451,11 @@ else:
 # ------------------------
 
 def send_once_and_exit():
+    """Send one pulse to all FORWARD_URLS then exit."""
     if not requests:
         print(
             "requests not installed",
-            file=sys.stderr,
+            file=sys.stderr
         )
         raise SystemExit(1)
 
@@ -425,7 +463,7 @@ def send_once_and_exit():
         "source": "breathe-cli",
         "timestamp": time.strftime(
             "%Y-%m-%dT%H:%M:%SZ",
-            time.gmtime(),
+            time.gmtime()
         ),
     }
 
@@ -436,37 +474,40 @@ def send_once_and_exit():
 
     ok = []
 
-    for url in FORWARD_URLS:
+    for target in FORWARD_URLS:
         try:
             response = session.post(
-                url,
+                target,
                 json=payload,
                 headers=headers,
                 timeout=10,
             )
 
             print(
-                f"POST {url} -> {response.status_code}"
+                f"POST {target} -> "
+                f"{response.status_code}"
             )
 
             ok.append(
-                (url, response.status_code)
+                (target, response.status_code)
             )
 
-        except Exception as e:
+        except Exception as exc:
             print(
-                f"ERROR posting to {url}: {e}",
-                file=sys.stderr,
+                f"ERROR posting to "
+                f"{target}: {exc}",
+                file=sys.stderr
             )
 
             ok.append(
-                (url, str(e))
+                (target, str(exc))
             )
 
     raise SystemExit(
         0
         if any(
-            isinstance(status, int) and status < 400
+            isinstance(status, int)
+            and status < 400
             for _, status in ok
         )
         else 2
@@ -474,7 +515,7 @@ def send_once_and_exit():
 
 
 # ------------------------
-# Compatibility endpoint
+# Compatibility pulse endpoint
 # ------------------------
 
 @app.route("/pulse_receiver", methods=["POST"])
@@ -489,13 +530,14 @@ def pulse_receiver():
 
     _log(
         "pulse_receiver: received ping ->",
-        payload,
+        payload
     )
 
     return jsonify({
         "status": "received",
         "service": "breathe-xozy",
         "timestamp": time.time(),
+        "echo": payload,
     }), 200
 
 
@@ -511,7 +553,10 @@ if __name__ == "__main__":
     parser.add_argument(
         "--once",
         action="store_true",
-        help="Send one pulse to all FORWARD_URLS then exit",
+        help=(
+            "Send one pulse to all "
+            "FORWARD_URLS then exit"
+        ),
     )
 
     args = parser.parse_args()
@@ -523,9 +568,9 @@ if __name__ == "__main__":
         os.environ.get("PORT", 5001)
     )
 
-    # dev server for local testing; in production use gunicorn
+    # Dev server for local testing;
+    # in production use gunicorn.
     app.run(
         host="0.0.0.0",
-        port=port,
+        port=port
     )
-```
