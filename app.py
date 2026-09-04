@@ -73,7 +73,7 @@ DEFAULT_FORWARD_URLS = [
 
     # FIXED: these are TWO separate targets, not one comma-joined string.
     "https://toror-technology.onrender.com",
-    "https://easyqr-11kk.onrender.com",
+    "https://otravel-bleg.onrender.com",
 ]
 
 
